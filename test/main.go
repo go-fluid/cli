@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/go-fluid/fluid"
+	"html/template"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -23,15 +24,13 @@ const (
 	BaseLogicLatestReleaseInfo         = "https://api.github.com/repos/go-uniform/base-logic/releases/latest"
 	BasePortalIonicLatestReleaseInfo   = "https://api.github.com/repos/go-fluid/base-portal-ionic/releases/latest"
 	BasePortalVuetifyLatestReleaseInfo = "https://api.github.com/repos/go-fluid/base-portal-vuetify/releases/latest"
-
-	CacheDirectory                  = ".fluid/cache"
-	BaseApiCacheDirectory           = CacheDirectory + "/api"
-	BaseLogicCacheDirectory         = CacheDirectory + "/logic"
-	BasePortalIonicCacheDirectory   = CacheDirectory + "/ionic"
-	BasePortalVuetifyCacheDirectory = CacheDirectory + "/vuetify"
 )
 
 var buildProject = func(project fluid.Project, directory string) {
+	if errs := project.Validate(); errs != nil {
+		panic(errs.Error())
+	}
+
 	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
 		panic(err)
 	}
@@ -49,28 +48,240 @@ var buildProject = func(project fluid.Project, directory string) {
 		panic(err)
 	}
 
-	// todo: build project
-	// todo: tarball project into given directory
+	buildApi(project, projectDirectory)
+	buildLogic(project, projectDirectory)
+
+	for _, portal := range project.Portals {
+
+		switch portal.Type {
+		case fluid.PortalTypeIonic:
+			buildPortalIonic(portal, projectDirectory)
+		case fluid.PortalTypeVuetify:
+			buildPortalVuetify(portal, projectDirectory)
+		default:
+			panic(fmt.Sprintf("portal type '%s' not supported", portal.Type))
+		}
+
+	}
 
 	projectFile := filepath.Join(directory, fmt.Sprintf("%s-%s.tar.gz", projectSlug, project.Version))
-	if err := ioutil.WriteFile(projectFile, []byte("hello world!"), os.ModePerm); err != nil {
+	cmd := exec.Command("tar", "-czvf", projectFile, "-C", temporaryDirectory, strings.TrimPrefix(projectDirectory, temporaryDirectory+"/"))
+	fmt.Println(cmd.String())
+	if err := cmd.Run(); err != nil {
 		panic(err)
 	}
+}
+
+var buildPortalIonic = func(portal fluid.Portal, temporaryDirectory string) {
+
+	if portal.Type != fluid.PortalTypeIonic {
+		panic(fmt.Sprintf("invalid portal type '%s' detected", portal.Type))
+	}
+
+	templateDirectory := filepath.Join(getCacheDirectory(), "portal-ionic/latest")
+	portalSlug := kebabCase(portal.Name)
+	targetDirectory := filepath.Join(temporaryDirectory, portalSlug)
+	copyDirectory(templateDirectory, targetDirectory)
+
+}
+
+var buildPortalVuetify = func(portal fluid.Portal, temporaryDirectory string) {
+
+	if portal.Type != fluid.PortalTypeVuetify {
+		panic(fmt.Sprintf("invalid portal type '%s' detected", portal.Type))
+	}
+
+	templateDirectory := filepath.Join(getCacheDirectory(), "portal-vuetify/latest")
+	portalSlug := kebabCase(portal.Name)
+	targetDirectory := filepath.Join(temporaryDirectory, portalSlug)
+	copyDirectory(templateDirectory, targetDirectory)
+
+}
+
+var buildApi = func(project fluid.Project, temporaryDirectory string) {
+
+	templateDirectory := filepath.Join(getCacheDirectory(), "api/latest")
+	targetDirectory := filepath.Join(temporaryDirectory, "api")
+	copyDirectory(templateDirectory, targetDirectory)
+	contractsDirectory := filepath.Join(targetDirectory, "service", "contracts")
+
+	for _, contract := range project.Contracts {
+
+		buildContractFile(contract, contractsDirectory)
+
+	}
+
+	cmd := exec.Command("gofmt", "-s", "-w", contractsDirectory)
+	fmt.Println(cmd.String())
+	if err := cmd.Run(); err != nil {
+		panic(err)
+	}
+
+}
+
+var buildLogic = func(project fluid.Project, temporaryDirectory string) {
+
+	templateDirectory := filepath.Join(getCacheDirectory(), "logic", "latest")
+	targetDirectory := filepath.Join(temporaryDirectory, "logic")
+	copyDirectory(templateDirectory, targetDirectory)
+	entitiesDirectory := filepath.Join(targetDirectory, "service", "entities")
+
+	for _, entity := range project.Entities {
+
+		buildEntityFile(entity, entitiesDirectory)
+
+	}
+
+	cmd := exec.Command("gofmt", "-s", "-w", entitiesDirectory)
+	fmt.Println(cmd.String())
+	if err := cmd.Run(); err != nil {
+		panic(err)
+	}
+
+}
+
+const entityFileTemplate = `package entities
+
+const (
+	Collection{{ .NamePlural | PascalCase }} = "{{ .NamePlural | CamelCase }}"
+)
+
+type {{ .NameSingular | PascalCase }} struct {
+
+{{range .Fields}}    {{ .Name | PascalCase }} {{ .Type }} ` + "`" + `bson:"{{ .Name | FieldCase }}"` + "`" + `
+{{end}}
+}
+`
+
+var buildEntityFile = func(entity fluid.Entity, directory string) {
+
+	entityFileName := fmt.Sprintf("%s.go", snakeCase(entity.NameSingular))
+	entityFilePath := filepath.Join(strings.TrimSuffix(directory, "entities"), "entities", entityFileName)
+	entityFile, err := os.Create(entityFilePath)
+
+	if err != nil {
+		panic(err)
+	}
+
+	defer func() { _ = entityFile.Close() }()
+
+	/* todo: add hidden fields
+	- createdAt
+	- modifiedAt
+	- deletedAt
+
+	- lockedAt (if has password field)
+	- loginAt (if has password field)
+	- loginAttempts (if has password field)
+	*/
+	// todo: handle link fields
+	// todo: handle attribute fields
+
+	tmpl := template.Must(
+		template.New(entity.NameSingular).Funcs(
+			template.FuncMap{
+				"FieldCase": func(value string) string {
+					if strings.ToLower(value) == "id" {
+						return "_id"
+					}
+					return camelCase(value)
+				},
+				"SnakeCase":  snakeCase,
+				"CamelCase":  camelCase,
+				"KebabCase":  kebabCase,
+				"TitleCase":  titleCase,
+				"PascalCase": pascalCase,
+			},
+		).Parse(
+			entityFileTemplate,
+		),
+	)
+
+	if err := tmpl.Execute(
+		entityFile,
+		entity,
+	); err != nil {
+		panic(err)
+	}
+
+}
+
+const contractFileTemplate = `package contracts
+
+type {{ .Name | PascalCase }}{{ .Type | PascalCase }} struct {
+
+{{range .Fields}}    {{ .Name | PascalCase }} {{ .Type }} ` + "`" + `bson:"{{ .Name | FieldCase }}"` + "`" + `
+{{end}}
+}
+`
+
+var buildContractFile = func(contract fluid.Contract, directory string) {
+
+	contractFileName := fmt.Sprintf("%s.go", snakeCase(fmt.Sprintf("%s %s", contract.Name, strings.ToTitle(contract.Type))))
+	contractFilePath := filepath.Join(strings.TrimSuffix(directory, "contracts"), "contracts", contractFileName)
+	contractFile, err := os.Create(contractFilePath)
+
+	if err != nil {
+		panic(err)
+	}
+
+	defer func() { _ = contractFile.Close() }()
+
+	/* todo: add hidden fields
+	- createdAt
+	- modifiedAt
+	- deletedAt
+
+	- lockedAt (if has password field)
+	- loginAt (if has password field)
+	- loginAttempts (if has password field)
+	*/
+	// todo: handle link fields
+	// todo: handle attribute fields
+
+	tmpl := template.Must(
+		template.New(contract.Name).Funcs(
+			template.FuncMap{
+				"FieldCase": func(value string) string {
+					if strings.ToLower(value) == "id" {
+						return "_id"
+					}
+					return camelCase(value)
+				},
+				"SnakeCase":  snakeCase,
+				"CamelCase":  camelCase,
+				"KebabCase":  kebabCase,
+				"TitleCase":  titleCase,
+				"PascalCase": pascalCase,
+			},
+		).Parse(
+			contractFileTemplate,
+		),
+	)
+
+	if err := tmpl.Execute(
+		contractFile,
+		contract,
+	); err != nil {
+		panic(err)
+	}
+
 }
 
 func main() {
 	homeDirectory, err := os.UserHomeDir()
+
 	if err != nil {
 		panic(err)
 	}
+
 	downloadDirectory := filepath.Join(homeDirectory, "Downloads")
-	updateCaches(homeDirectory)
+
+	updateCaches()
 	buildProject(fluidProjectScheme, downloadDirectory)
 }
 
-
 /* Routines */
-
 
 type BaseTemplateRepository struct {
 	LatestReleaseInfo string
@@ -97,6 +308,16 @@ var extractTarball = func(gzipStream io.Reader, directory string) {
 	if err := cmd.Run(); err != nil {
 		panic(err)
 	}
+}
+
+var copyDirectory = func(sourceDirectory, targetDirectory string) {
+
+	cmd := exec.Command("cp", "-RL", sourceDirectory, targetDirectory)
+	fmt.Println(cmd.String())
+	if err := cmd.Run(); err != nil {
+		panic(err)
+	}
+
 }
 
 var doRequest = func(client *http.Client, request *http.Request) ([]byte, int, error) {
@@ -189,8 +410,19 @@ var getDownloadStream = func(uri string) io.ReadCloser {
 	return stream
 }
 
-var updateCaches = func(rootDirectory string) {
-	cacheDirectory := filepath.Join(rootDirectory, CacheDirectory)
+var getCacheDirectory = func() string {
+	homeDirectory, err := os.UserHomeDir()
+
+	if err != nil {
+		panic(err)
+	}
+
+	cacheDirectory := filepath.Join(homeDirectory, ".cache/fluid")
+	return cacheDirectory
+}
+
+var updateCaches = func() {
+	cacheDirectory := getCacheDirectory()
 
 	if err := os.MkdirAll(cacheDirectory, os.ModePerm); err != nil {
 		panic(err)
@@ -199,19 +431,19 @@ var updateCaches = func(rootDirectory string) {
 	templateRepositories := []BaseTemplateRepository{
 		{
 			LatestReleaseInfo: BaseApiLatestReleaseInfo,
-			CacheDirectory:    filepath.Join(rootDirectory, BaseApiCacheDirectory),
+			CacheDirectory:    filepath.Join(cacheDirectory, "api"),
 		},
 		{
 			LatestReleaseInfo: BaseLogicLatestReleaseInfo,
-			CacheDirectory:    filepath.Join(rootDirectory, BaseLogicCacheDirectory),
+			CacheDirectory:    filepath.Join(cacheDirectory, "logic"),
 		},
 		{
 			LatestReleaseInfo: BasePortalIonicLatestReleaseInfo,
-			CacheDirectory:    filepath.Join(rootDirectory, BasePortalIonicCacheDirectory),
+			CacheDirectory:    filepath.Join(cacheDirectory, "portal-ionic"),
 		},
 		{
 			LatestReleaseInfo: BasePortalVuetifyLatestReleaseInfo,
-			CacheDirectory:    filepath.Join(rootDirectory, BasePortalVuetifyCacheDirectory),
+			CacheDirectory:    filepath.Join(cacheDirectory, "portal-vuetify"),
 		},
 	}
 
@@ -264,9 +496,7 @@ var updateCaches = func(rootDirectory string) {
 	}
 }
 
-
 /* Helpers */
-
 
 func isUpperCase(r rune) bool {
 	if strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZ", r) {
@@ -360,6 +590,68 @@ func kebabCase(anyCase string) string {
 	}
 
 	return strings.Replace(strings.Trim(keep(strings.ToLower(anyCase), "abcdefghijklmnopqrstuvwxyz0123456789-"), "-"), "--", "-", -1)
+}
+
+func camelCase(kebab string) (camelCase string) {
+	kebab = kebabCase(kebab)
+
+	isToUpper := false
+	for _, runeValue := range kebab {
+		if isToUpper {
+			camelCase += strings.ToUpper(string(runeValue))
+			isToUpper = false
+		} else {
+			if runeValue == '-' {
+				isToUpper = true
+			} else {
+				camelCase += string(runeValue)
+			}
+		}
+	}
+	return
+}
+
+func pascalCase(kebab string) (pascalCase string) {
+	kebab = kebabCase(kebab)
+
+	isToUpper := false
+	for i, runeValue := range kebab {
+		if isToUpper || i == 0 {
+			pascalCase += strings.ToUpper(string(runeValue))
+			isToUpper = false
+		} else {
+			if runeValue == '-' {
+				isToUpper = true
+			} else {
+				pascalCase += string(runeValue)
+			}
+		}
+	}
+	return
+}
+
+func snakeCase(kebab string) string {
+	return strings.Replace(strings.ToLower(kebabCase(kebab)), "-", "_", -1)
+}
+
+func titleCase(kebab string) (titleCase string) {
+	kebab = kebabCase(kebab)
+
+	isToUpper := false
+	for i, runeValue := range kebab {
+		if isToUpper || i == 0 {
+			titleCase += strings.ToUpper(string(runeValue))
+			isToUpper = false
+		} else {
+			if runeValue == '-' {
+				isToUpper = true
+				titleCase += " "
+			} else {
+				titleCase += string(runeValue)
+			}
+		}
+	}
+	return
 }
 
 /* Project */
@@ -482,8 +774,15 @@ var fluidProjectScheme = fluid.Project{
 			},
 			Actions: []fluid.EntityAction{
 				{
-					Name:                       " Build",
+					Name:                       "Build",
 					Description:                "Generate code for api, logic and portals based on project's structure",
+					Type:                       fluid.EntityActionTypeList,
+					Method:                     fluid.EntityActionMethodGet,
+					EnableFileDownloadResponse: true,
+				},
+				{
+					Name:                       "Scheme",
+					Description:                "Generate fluid scheme json object blueprint",
 					Type:                       fluid.EntityActionTypeList,
 					Method:                     fluid.EntityActionMethodGet,
 					EnableFileDownloadResponse: true,
