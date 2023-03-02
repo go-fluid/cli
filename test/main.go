@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/go-fluid/fluid"
-	"html/template"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -13,11 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"text/template"
 	"time"
 )
-
-// todo: generate `entity` directory, each entity gets its own file: {{snake(nameSingular)}}.go
-// todo: generate `contract` directory, each contract get its own file: {{snake(name)}}.{{snake(type)}}.go
 
 const (
 	BaseApiLatestReleaseInfo           = "https://api.github.com/repos/go-uniform/base-api/releases/latest"
@@ -26,7 +23,7 @@ const (
 	BasePortalVuetifyLatestReleaseInfo = "https://api.github.com/repos/go-fluid/base-portal-vuetify/releases/latest"
 )
 
-var buildProject = func(project fluid.Project, directory string) {
+var buildProject = func(project fluid.Project, directory string, archiveOutput bool) {
 	if errs := project.Validate(); errs != nil {
 		panic(errs.Error())
 	}
@@ -53,23 +50,54 @@ var buildProject = func(project fluid.Project, directory string) {
 
 	for _, portal := range project.Portals {
 
+		portalSlug := kebabCase(portal.Name)
+		portalDirectory := filepath.Join(projectDirectory, portalSlug)
+		portalRepositoriesBaseDirectory := filepath.Join(portalDirectory, "repositories")
+
 		switch portal.Type {
 		case fluid.PortalTypeIonic:
 			buildPortalIonic(portal, projectDirectory)
+			portalRepositoriesBaseDirectory = filepath.Join(portalDirectory, "src", "services", "repositories")
 		case fluid.PortalTypeVuetify:
 			buildPortalVuetify(portal, projectDirectory)
+			portalRepositoriesBaseDirectory = filepath.Join(portalDirectory, "src", "services", "repositories")
 		default:
 			panic(fmt.Sprintf("portal type '%s' not supported", portal.Type))
 		}
 
+		if err := os.MkdirAll(portalRepositoriesBaseDirectory, os.ModePerm); err != nil {
+			panic(err)
+		}
+
+		for _, entity := range project.Entities {
+			buildRepositoryFile(entity, portalRepositoriesBaseDirectory)
+		}
+
 	}
 
-	projectFile := filepath.Join(directory, fmt.Sprintf("%s-%s.tar.gz", projectSlug, project.Version))
-	cmd := exec.Command("tar", "-czvf", projectFile, "-C", temporaryDirectory, strings.TrimPrefix(projectDirectory, temporaryDirectory+"/"))
-	fmt.Println(cmd.String())
-	if err := cmd.Run(); err != nil {
-		panic(err)
+	projectVersionedName := fmt.Sprintf("%s-%s", projectSlug, project.Version)
+	fluidDirectory := filepath.Join(temporaryDirectory, "fluid")
+	if archiveOutput {
+		projectFile := filepath.Join(directory, fmt.Sprintf("%s.tar.gz", projectVersionedName))
+		cmd := exec.Command("tar", "-czvf", projectFile, "-C", fluidDirectory, ".")
+		fmt.Println(cmd.String())
+		if err := cmd.Run(); err != nil {
+			panic(err)
+		}
+	} else {
+		projectDirectory := filepath.Join(directory, projectVersionedName)
+		cmd := exec.Command("rm", "-rf", projectDirectory)
+		fmt.Println(cmd.String())
+		if err := cmd.Run(); err != nil {
+			panic(err)
+		}
+		cmd = exec.Command("cp", "-r", fluidDirectory, projectDirectory)
+		fmt.Println(cmd.String())
+		if err := cmd.Run(); err != nil {
+			panic(err)
+		}
 	}
+
 }
 
 var buildPortalIonic = func(portal fluid.Portal, temporaryDirectory string) {
@@ -117,6 +145,17 @@ var buildApi = func(project fluid.Project, temporaryDirectory string) {
 		panic(err)
 	}
 
+	fluidJsonData, err := json.MarshalIndent(project, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	fluidJsonFilePath := filepath.Join(targetDirectory, "fluid.json")
+	if err := ioutil.WriteFile(fluidJsonFilePath, fluidJsonData, os.ModePerm); err != nil {
+		panic(err)
+	}
+
+	// todo: generate openapi.json
+	// todo: generate api documentation based on openapi.json
 }
 
 var buildLogic = func(project fluid.Project, temporaryDirectory string) {
@@ -138,6 +177,14 @@ var buildLogic = func(project fluid.Project, temporaryDirectory string) {
 		panic(err)
 	}
 
+	fluidJsonData, err := json.MarshalIndent(project, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	fluidJsonFilePath := filepath.Join(targetDirectory, "fluid.json")
+	if err := ioutil.WriteFile(fluidJsonFilePath, fluidJsonData, os.ModePerm); err != nil {
+		panic(err)
+	}
 }
 
 const entityFileTemplate = `package entities
@@ -268,6 +315,111 @@ var buildContractFile = func(contract fluid.Contract, directory string) {
 
 }
 
+const repositoryFileTemplate = `import {Repository} from '@/services/base/global.interfaces';
+import {EnumValueType, EnumHeaderAlign} from '@/services/base/global.enums';
+import {Section} from '@/services/base/global.classes.section';
+import {permissions} from '@/services/repositories/permissions';
+import {Attributes, Link} from '@/services/base/global.types';
+{{ Imports }}
+const entity = '{{ .NamePlural | CamelCase }}';
+const slug = '{{ .NamePlural | KebabCase }}';
+
+export interface {{ .NamePlural | PascalCase }} {
+{{range .Fields}}    {{ .Name | CamelCase }}: any;
+{{end}}}
+
+const repository = new Repository<{{ .NamePlural | PascalCase }}>(slug, {}, {
+    freeTextSearch: {{ .EnableFreeTextSearch }},
+    disableCreation: {{ .DisableCreate }},
+});
+{{range .Fields}}
+repository.addField('{{ .Name | CamelCase }}', {
+  type: EnumValueType.Text,
+});
+{{end}}
+
+repository.setHeaders([
+{{range .Fields}}
+  {
+    fieldKey: '{{ .Name | CamelCase }}',
+    align: EnumHeaderAlign.Start,
+  },
+{{end}}
+]);
+
+{{ Sections }}
+
+repository.bulkActions = [
+  {
+    color: 'error',
+    icon: 'mdi-delete',
+    title: '$vuetify.entityList.delete',
+    key: 'delete'
+  }
+];
+
+export const {{ .NamePlural | CamelCase }} = repository;
+`
+
+var buildRepositoryFile = func(entity fluid.Entity, directory string) {
+
+	repositoryFileName := fmt.Sprintf("%s.ts", kebabCase(entity.NameSingular))
+	repositoryFilePath := filepath.Join(directory, repositoryFileName)
+	repositoryFile, err := os.Create(repositoryFilePath)
+
+	if err != nil {
+		panic(err)
+	}
+
+	defer func() { _ = repositoryFile.Close() }()
+
+	/* todo: add hidden fields
+	- createdAt
+	- modifiedAt
+	- deletedAt
+
+	- lockedAt (if has password field)
+	- loginAt (if has password field)
+	- loginAttempts (if has password field)
+	*/
+	// todo: handle link fields
+	// todo: handle attribute fields
+
+	tmpl := template.Must(
+		template.New(entity.NameSingular).Funcs(
+			template.FuncMap{
+				"Imports": func() string {
+					return "// todo: additional imports go here!\n"
+				},
+				"Sections": func() string {
+					return "// todo: sections go here!"
+				},
+				"FieldCase": func(value string) string {
+					if strings.ToLower(value) == "id" {
+						return "_id"
+					}
+					return camelCase(value)
+				},
+				"SnakeCase":  snakeCase,
+				"CamelCase":  camelCase,
+				"KebabCase":  kebabCase,
+				"TitleCase":  titleCase,
+				"PascalCase": pascalCase,
+			},
+		).Parse(
+			repositoryFileTemplate,
+		),
+	)
+
+	if err := tmpl.Execute(
+		repositoryFile,
+		entity,
+	); err != nil {
+		panic(err)
+	}
+
+}
+
 func main() {
 	homeDirectory, err := os.UserHomeDir()
 
@@ -278,7 +430,7 @@ func main() {
 	downloadDirectory := filepath.Join(homeDirectory, "Downloads")
 
 	updateCaches()
-	buildProject(fluidProjectScheme, downloadDirectory)
+	buildProject(fluidProjectScheme, downloadDirectory, false)
 }
 
 /* Routines */
